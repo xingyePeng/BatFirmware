@@ -1,0 +1,380 @@
+// For hardware SPI, connect:
+//   ATtiny84 pin 5 (DIP pin 8, PA5)  to 74HC595 pin 14 (data in)
+//   ATtiny84 pin 6 (DIP pin 9, PA4)  to 74HC595 pin 11 (shift register clock)
+//   ATtiny84 pin 7 (DIP pin 10, PA3) to 74HC595 pin 12 (storage register clock)
+//
+// For software SPI (shiftOut), connect:
+//   ATtiny84 pin 8  (DIP pin 11, PA2) to 74HC595 pin 14 (data in)
+//   ATtiny84 pin 9  (DIP pin 12, PA1) to 74HC595 pin 11 (shift register clock)
+//   ATtiny84 pin 10 (DIP pin 13, PA0) to 74HC595 pin 12 (storage register clock)
+
+/*
+   4MHZ WITH NO START-UP TIME
+   /Users/alexburton/Library/Arduino15/packages/arduino/tools/avrdude/6.3.0-arduino17/bin/avrdude -C/Users/alexburton/Library/Arduino15/packages/ATTinyCore/hardware/avr/1.4.1/avrdude.conf -v -pattiny84 -cstk500v1 -P/dev/cu.usbserial-14410 -b19200 -e -Uefuse:w:0xFF:m -Uhfuse:w:0xD7:m -Ulfuse:w:0x42:m -Uflash:w:/Users/alexburton/Library/Arduino15/packages/ATTinyCore/hardware/avr/1.4.1/bootloaders/empty/empty_all.hex:i
+
+  /Users/kevinkasper/Library/Arduino15/packages/arduino/tools/avrdude/6.3.0-arduino18/bin/avrdude -C/Users/kevinkasper/Library/Arduino15/packages/ATTinyCore/hardware/avr/1.5.2/avrdude.conf -v -pattiny84 -cstk500v1 -P/dev/cu.usbserial-14440 -b19200 -e -Uefuse:w:0xFF:m -Uhfuse:w:0xD7:m -Ulfuse:w:0x42:m -Uflash:w:/Users/kevinkasper/Library/Arduino15/packages/ATTinyCore/hardware/avr/1.5.2/bootloaders/empty/empty_all.hex:i
+  C:\Users\Corey\Documents\ArduinoData\packages\arduino\tools\avrdude\6.3.0-arduino18/bin/avrdude -CC:\Users\Corey\Documents\ArduinoData\packages\ATTinyCore\hardware\avr\1.5.2/avrdude.conf -v -pattiny84 -cstk500v1 -PCOM4 -b19200 -e -Uefuse:w:0xFF:m -Uhfuse:w:0xD7:m -Ulfuse:w:0x42:m -Uflash:w:C:\Users\Corey\Documents\ArduinoData\packages\ATTinyCore\hardware\avr\1.5.2/bootloaders/empty/empty_all.hex:i
+
+   8 Mhz
+/Users/alexburton/Library/Arduino15/packages/arduino/tools/avrdude/6.3.0-arduino17/bin/avrdude -C/Users/alexburton/Library/Arduino15/packages/ATTinyCore/hardware/avr/1.4.1/avrdude.conf -v -pattiny84 -cstk500v1 -P/dev/cu.usbserial-14320 -b19200 -e -Uefuse:w:0xFF:m -Uhfuse:w:0xDF:m -Ulfuse:w:0xC2:m -Uflash:w:/Users/alexburton/Library/Arduino15/packages/ATTinyCore/hardware/avr/1.4.1/bootloaders/optiboot/optiboot_attiny84_8000000L.hex:i
+*/
+
+// Channel A = 30, B = 31, C = 32, D = 33
+
+#include <tinySPI.h>        // https://github.com/JChristensen/tinySPI
+#include <avr/sleep.h>
+#include <avr/wdt.h>
+#include <EEPROM.h>                     // Writing takes 4 µs Reading takes 200ns
+//#define SLEEP_MODE_IDLE   0
+
+#ifndef cbi
+#define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
+#endif
+#ifndef sbi
+#define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
+#endif
+
+// Pin definitions
+volatile boolean f_wdt = 1;
+
+const int indicator(6);
+const int SPI_LATCH(3);                   // Storage register clock (slave select) -- hardware
+const int SPI_CLR(0);
+int shiftedamplitude;
+int delaybetweenpulses;
+int shiftedpulsewidth;
+
+int stimamplitude;
+int stimperiod;
+int pulsewidth;
+int selectedGroup;
+
+byte codeselectedDAC;
+byte codePartnerDAC;
+byte codeImpedances;
+byte codeHighImpedances;
+byte codeAllDACs;
+byte askDebug = 2;                        // For debugging ASK communication. Two pulses on device startup = ASK writing a 0. Three pulses = ASK writing a 1.
+
+
+void SetupAfterNOC() {
+    DDRA = DDRA | B01001011;
+    DDRB = DDRB | B00000000;
+    PORTA = B00000000;
+}
+
+/*
+    EEPROM Address Descriptions:
+
+    EEPROM 0: Indicates failure/success of data write
+    EEPROM 2: Counter for how many bits have already been successfully stored
+    EEPROM 3: Bit to be stored. Vale derived from on-duration of device in previous cycle.
+                --> 0 if < 30ms. 1 if > 30ms.
+
+    EEPROM 4:   Temporary storage for STIMULATION AMPLITUDE data.
+    EEPROM 5:   STIMULATION AMPLITUDE data
+
+    EEPROM 6:   Temporary storage for DAC SELECTION data.
+    EEPROM 7:   DAC SELECTION data
+
+    EEPROM 8:   Temporary storage for PULSE WIDTH data.
+    EEPROM 9:   PULSE WIDTH data
+
+    EEPROM 10:  Temporary storage for STIMULATION PERIOD data.
+    EEPROM 11:  STIMULATION PERIOD data
+*/
+
+void noc_eeprom_manipulation() {
+  EEPROM.update(0, 1);                    // Indicate that device has turned on
+  byte bitcounter = EEPROM.read(2);
+
+  if (bitcounter > 0 && bitcounter < 21) {
+    byte storedbit = EEPROM.read(3);
+
+    if (bitcounter < 7) {                                       // Bits 1 to 6
+      byte tempampdata = EEPROM.read(4);                        // Retrieve existing byte for temp period
+      EEPROM.update(4, (tempampdata << 1) | storedbit);         // Append the storedbit from last power cycle
+      if (bitcounter == 6) {
+        EEPROM.update(5, (tempampdata << 1) | storedbit);       // At the end of the first 6 bits, update the stim period
+      }
+    }
+
+    else if (bitcounter < 9) {
+      byte tempdacdata = EEPROM.read(6);
+      EEPROM.update(6, (tempdacdata << 1) | storedbit);
+      if (bitcounter == 8) {
+        EEPROM.update(7, (tempdacdata << 1) | storedbit);
+      }
+    }
+
+    else if (bitcounter < 15) {
+      byte temppulsewidthdata = EEPROM.read(8);
+      EEPROM.update(8, (temppulsewidthdata << 1) | storedbit);
+      if (bitcounter == 14) {
+        EEPROM.update(9, (temppulsewidthdata << 1) | storedbit);
+      }
+    }
+
+    else {
+      byte tempperioddata = EEPROM.read(10);
+      EEPROM.update(10, (tempperioddata << 1) | storedbit);
+      if (bitcounter == 20) {
+        EEPROM.update(11, (tempperioddata << 1) | storedbit);
+        system_sleep();
+        EEPROM.update(2, 0);        // Indicates no errors in data transfer
+        EEPROM.update(0, 2);        // Indicates all bits have transfered
+
+        EEPROM.update(4, 0);        // Reset temporary STIMULATION AMPLITUDE byte
+        EEPROM.update(6, 0);        // Reset temporary DAC SELECTION byte
+        EEPROM.update(8, 0);        // Reset temporary PULSE WIDTH byte
+        EEPROM.update(10, 0);       // Reset temporary STIMULATION PERIOD byte
+        SetupAfterNOC();
+        return;
+      }
+    }
+  }
+
+  EEPROM.update(2, bitcounter + 1);     // Increment Counter (takes 5ms to get here)
+  EEPROM.update(3, 0);                  // Write 0
+//  bitSet(PORTA, askDebug);
+//  delay(1);
+//  bitClear(PORTA, askDebug);
+  delay(20+10);                          // minus 2 for the two delays
+  EEPROM.update(3, 1);                  // Write 1
+//  bitSet(PORTA, askDebug);
+//  delay(1);
+//  bitClear(PORTA, askDebug);
+  delay(30+20);
+  EEPROM.update(0, 0);                  // Indicate failure to program
+  system_sleep();
+  EEPROM.update(2, 0);                  // Reset Counter
+  EEPROM.update(4, 0);                  // Reset temporary DATA
+  EEPROM.update(6, 0);                  // Reset temporary DATA
+  EEPROM.update(8, 0);                  // Reset temporary DATA
+  EEPROM.update(10, 0);                  // Reset temporary DATA
+  SetupAfterNOC();
+}
+
+// For biphasic stimulation, we use a pair of DACs. The first one gets pulled high while the partner is low. The stim period elapses. The first one is pulled low and the partner is pulled high.
+// We have arbitrarily selected the following four pairings
+void dacGroupSelect(byte selectedGroup) {
+  switch (selectedGroup) {
+    case 0:
+      codeselectedDAC     =   0x32;           // DAC C
+      codePartnerDAC      =   0x31;           // DAC B
+      sendCommand(0x40, 0x0600);              // Power-down normal operation:     C, B
+      system_sleep();
+      system_sleep();
+      system_sleep();
+      sendCommand(0x43, 0x0900);              // Power-down with high impedance:  A, D
+      break;
+    case 1:
+      codeselectedDAC     =   0x31;           // DAC B
+      codePartnerDAC      =   0x33;           // DAC D
+      sendCommand(0x40, 0x0A00);              // Power-down normal operation:     B, D
+      system_sleep();
+      system_sleep();
+      system_sleep();
+      sendCommand(0x43, 0x0500);              // Power-down with high impedance:  A, C
+      break;
+    case 2:
+      codeselectedDAC     =   0x33;           // DAC D
+      codePartnerDAC      =   0x30;           // DAC A
+      sendCommand(0x40, 0x0900);              // Power-down normal operation:     D, A
+      system_sleep();
+      system_sleep();
+      system_sleep();
+      sendCommand(0x43, 0x0600);              // Power-down with high impedance:  C, B
+      break;
+    case 3:
+      codeselectedDAC     =   0x32;           // DAC C
+      codePartnerDAC      =   0x30;           // DAC A
+      sendCommand(0x40, 0x0500);              // Power-down normal operation:     C, A
+      system_sleep();
+      system_sleep();
+      system_sleep();
+      sendCommand(0x43, 0x0A00);              // Power-down with high impedance:  B, D
+      break;
+  }
+
+  for (int i = 0; i < 31; i++) {
+    system_sleep();
+  }
+}
+
+void system_sleep() {
+  cbi(ADCSRA, ADEN);                   // switch Analog to Digitalconverter OFF
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN); // sleep mode is set here
+  sleep_enable();
+  sleep_mode();                        // System sleeps here
+  sleep_disable();                     // System continues execution here when watchdog timed out
+  sbi(ADCSRA, ADEN);                   // switch Analog to Digitalconverter ON
+}
+
+void setup_watchdog(int ii) { // 0=16ms, 1=32ms,2=64ms,3=128ms,4=250ms,5=500ms, 6=1 sec,7=2 sec, 8=4 sec, 9= 8sec
+  byte bb;
+  int ww;
+  if (ii > 9 ) ii = 9;
+  bb = ii & 7;
+  if (ii > 7) bb |= (1 << 5);
+  bb |= (1 << WDCE);
+  ww = bb;
+  MCUSR &= ~(1 << WDRF);
+  WDTCSR |= (1 << WDCE) | (1 << WDE);   // start timed sequence
+  WDTCSR = bb;                          // set new watchdog timeout value
+  WDTCSR |= _BV(WDIE);
+}
+
+ISR(WDT_vect) {   // Watchdog Interrupt Service is executed when watchdog timed out
+  f_wdt = 1;      // set global flag
+}
+
+void setup() {
+//  set_sleep_mode(SLEEP_MODE_IDLE);
+//  
+//  for (int i = 0; i < 10; i++) {
+//    sleep_mode();
+//  }
+  setup_watchdog(0);
+  system_sleep();
+//  pinMode(askDebug, OUTPUT);
+//  bitSet(PORTA, askDebug);
+//  delay(1);
+//  bitClear(PORTA, askDebug);
+  noc_eeprom_manipulation();
+  
+  SPI.begin();
+  SPI.setDataMode(SPI_MODE1);       // Start hardware SPI
+  pinMode(SPI_LATCH, OUTPUT);
+  pinMode(SPI_CLR, OUTPUT);
+  pinMode(indicator, OUTPUT);
+
+  bitWrite(PORTA, SPI_CLR, 1);
+  bitWrite(PORTA, SPI_CLR, 0);
+  bitWrite(PORTA, SPI_CLR, 1);
+
+  stimamplitude   =   EEPROM.read(5);
+  selectedGroup   =   EEPROM.read(7);
+  pulsewidth      =   EEPROM.read(9);
+  stimperiod      =   EEPROM.read(11);
+  
+  system_sleep();
+
+  for (int i = 0; i < 10; i++) {
+    bitWrite(PORTA, indicator, 1);
+    system_sleep();
+    bitWrite(PORTA, indicator, 0);
+    system_sleep();
+  }
+
+//  Method to debug values out of the EEPROM
+//  bitSet(PORTA, askDebug);
+//  delay(1);
+
+  system_sleep();
+  
+  dacGroupSelect(selectedGroup);
+
+  // Alex did this and when asked for explanation, he said, "I did the math. trust me, it works."
+  // shiftedamplitude = (stimamplitude * 65) << 4;
+  shiftedamplitude = (945 + 50 * stimamplitude) << 4;
+
+  if ((stimperiod > 0) & (stimperiod < 21)) {
+    delaybetweenpulses = stimperiod;
+  }
+
+  if ((stimperiod > 20) & (stimperiod < 37)) {
+    delaybetweenpulses = (((stimperiod - 21) * 5) + 25 );
+  }
+
+  if ((stimperiod > 36) & (stimperiod < 57)) {
+    delaybetweenpulses = (((stimperiod - 37) * 10) + 110 );
+  }
+
+  if (stimperiod > 56) {
+    delaybetweenpulses = (((stimperiod - 57) * 100) + 400 );
+  }
+
+
+  if (pulsewidth < 10) {
+    shiftedpulsewidth = (pulsewidth * 5) + 5 ;
+  }
+
+  if (pulsewidth > 11) {
+    shiftedpulsewidth = (((pulsewidth - 10) * 10) + 20 );
+  }
+  
+  for (int i = 0; i < 30; i++) {
+    system_sleep();
+  }
+  
+  if (EEPROM.read(0) == 2) {
+    for (int i = 0; i < 10; i++) {
+      bitWrite(PORTA, indicator, 1);
+      system_sleep();
+      bitWrite(PORTA, indicator, 0);
+      system_sleep();
+    }
+  }
+  //  for (int i = 0; i < 100; i++) {   // Each sleep cycle takes around (x * 2ms) - 1ms so this is around 99ms
+  //    sleep_mode();
+  //  }
+  system_sleep();
+  system_sleep();
+
+  // Reference must be sent in void loop... IDK?... but it works
+  //  sendCommand(0x74, 0x0000);        // Set internal REF voltage to EXT
+  sendCommand(0x77, 0x0000);        // Set internal REF to 4V
+  system_sleep();
+  system_sleep();
+}
+
+void loop() {
+  sendCommand(0x77, 0x0000);        // Set internal REF to 4V YES NEED A TON OF THESE
+  sendCommand(codeselectedDAC, shiftedamplitude);
+  sendCommand(0x77, 0x0000);        // Set internal REF to 4V
+  delayMicroseconds(shiftedpulsewidth);
+  
+  sendCommand(0x82, 0x0000);
+
+  sendCommand(codePartnerDAC, shiftedamplitude);
+  sendCommand(0x77, 0x0000);        // Set internal REF to 4V
+  delayMicroseconds(shiftedpulsewidth);
+
+  sendCommand(0x82, 0x0000);
+  
+  if (stimperiod == 0) {
+    delayMicroseconds(500);
+  } else {
+    delay(delaybetweenpulses);
+  }
+}
+
+/* Send SPI commands. Format is a one byte command (includes DAC selection) followed by two bytes of data
+
+    First nibble defines DAC commands:
+    0 0 1 1 (or 0x3) is command CODEn_LOADn
+
+    Second nibble defines DAC selection:
+    All DACs: 1 0 0 0 (or 0x8) [Other options exist but this is simple]
+    DAC A:    0 0 0 0
+    DAC B:    0 0 0 1
+    DAC C:    0 0 1 0
+    DAC D:    0 0 1 1
+
+    Nibbles 3, 4, and 5 are the value written to the DAC code register. Nibble 6 is ignored.
+    We therefore shift our desired amplitude value to the left by four bits (size of one nibble).
+
+    Vout = Vref x D / 2^N
+    D = value in DAC Code register
+    N = resolution. Our chip uses 12-bit res.
+*/
+void sendCommand(byte command, int indata) {    // Takes around 52 us to complete this transfer
+  bitWrite(PORTA, SPI_LATCH, 0);
+
+  SPI.transfer(command);
+  SPI.transfer((indata >> 8) & 0xFF) ;
+  SPI.transfer((indata) & 0xFF);
+
+  bitWrite(PORTA, SPI_LATCH, 1);
+}
